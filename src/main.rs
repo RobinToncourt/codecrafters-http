@@ -1,5 +1,7 @@
+#![allow(dead_code)]
 #[allow(unused_imports)]
 use std::fmt;
+use std::slice::Join;
 use std::io::{
     prelude::*,
     Write,
@@ -92,7 +94,7 @@ impl fmt::Display for Header {
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 struct HttpResponse {
     status_line: StatusLine,
-    header: Header,
+    headers: Vec<Header>,
     response_body: String,
 }
 
@@ -100,10 +102,21 @@ impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}\r\n{}\r\n{}",
             self.status_line,
-            self.header,
+            self.headers,
             self.response_body
         )
     }
+}
+
+fn join_headers(headers: &Vec<Header>) -> String {
+    let mut joined_headers = String::new();
+
+    headers.iter()
+        .for_each(
+            |header| joined_headers.push_str(&header.to_string())
+        );
+
+    joined_headers
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -114,6 +127,15 @@ struct StatusLine {
 
 impl StatusLine {
     const HTTP_1_1: &'static str = "HTTP/1.1";
+}
+
+impl StatusLine {
+    fn new(status_code: StatusCode) -> Self {
+        Self {
+            http_version: StatusLine::HTTP_1_1.to_string(),
+            status_code,
+        }
+    }
 }
 
 impl fmt::Display for StatusLine {
@@ -174,13 +196,11 @@ fn generate_response(status_code: StatusCode) -> String {
     //let content = generate_body();
 
     //format!("{status}{header}{content}")
-    todo!()
+    format!("{status}")
 }
 
 fn generate_status_line(status_code: StatusCode) -> StatusLine {
-    format!("HTTP/1.1 200 OK\r\n");
-
-    todo!()
+    StatusLine::new(status_code)
 }
 
 fn generate_header() -> Header {
