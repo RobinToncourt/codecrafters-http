@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 #[allow(unused_imports)]
 use std::fmt;
-use std::slice::Join;
 use std::io::{
     prelude::*,
     Write,
@@ -12,6 +11,8 @@ use std::net::{
     TcpListener,
 };
 
+const CRLF: &str = "\r\n";
+
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 enum HttpError {
 
@@ -21,7 +22,7 @@ enum HttpError {
 struct HttpRequest {
     request_line: RequestLine,
     headers: Vec<Header>,
-    body: String,
+    request_body: RequestBody,
 }
 
 impl HttpRequest {
@@ -33,7 +34,7 @@ impl HttpRequest {
             .take_while(|line| !line.is_empty())
             .collect();
 
-        let body = http_request.pop().unwrap();
+        let request_body = RequestBody(http_request.pop().unwrap());
         let mut headers: Vec<Header> = Vec::new();
         while http_request.len() > 1 {
             headers.push(Header::from_str(&http_request.pop().unwrap()).unwrap())
@@ -42,7 +43,7 @@ impl HttpRequest {
         let request_line =
             RequestLine::from_str(&http_request.pop().unwrap()).unwrap();
 
-        Ok(Self { request_line, headers, body })
+        Ok(Self { request_line, headers, request_body })
     }
 }
 
@@ -67,27 +68,36 @@ impl RequestLine {
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 struct Header {
-    info: String,
-    content: String,
+    name: String,
+    value: String,
 }
 
 impl Header {
     fn from_str(header: &str) -> Result<Self, HttpError> {
         let mut split = header.split(": ");
 
-        let info = split.next().unwrap().to_string();
-        let content = split.next().unwrap().to_string();
+        let name = split.next().unwrap().to_string();
+        let value = split.next().unwrap().to_string();
 
-        Ok(Self { info, content })
+        Ok(Self { name, value })
     }
 }
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}\r\n",
-               self.info,
-               self.content,
+        write!(f, "{}: {}{CRLF}",
+               self.name,
+               self.value,
         )
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+struct RequestBody(String);
+
+impl fmt::Display for RequestBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -95,14 +105,14 @@ impl fmt::Display for Header {
 struct HttpResponse {
     status_line: StatusLine,
     headers: Vec<Header>,
-    response_body: String,
+    response_body: ResponseBody,
 }
 
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}\r\n{}\r\n{}",
+        write!(f, "{}{CRLF}{}{CRLF}{}",
             self.status_line,
-            self.headers,
+            join_headers(&self.headers),
             self.response_body
         )
     }
@@ -163,6 +173,15 @@ impl StatusCode {
     }
 }
 
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+struct ResponseBody(String);
+
+impl fmt::Display for ResponseBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
@@ -181,33 +200,54 @@ fn main() {
 fn handle_connection(mut stream: TcpStream) {
     let http_request = HttpRequest::from_stream(&mut stream).unwrap();
 
-    let response: &str =
-        match http_request.request_line.request_target.as_str() {
-        "/" => "HTTP/1.1 200 OK\r\n\r\n",
-        _ => "HTTP/1.1 404 Not Found\r\n\r\n",
+    let response: String =
+        if http_request.request_line.request_target.eq("/") {
+        format!("HTTP/1.1 200 OK{CRLF}{CRLF}")
+    }
+    else if http_request.request_line.request_target.starts_with("/echo/") {
+        let (mut headers, response_body): (Vec<Header>, ResponseBody) =
+            echo_page(&http_request);
+
+        let content_type = Header {
+            name: "Content-Type".to_string(),
+            value: "text/plain".to_string(),
+        };
+        headers.insert(0, content_type);
+
+        let status_line = StatusLine::new(StatusCode::OK);
+
+        let http_response = HttpResponse {
+            status_line,
+            headers,
+            response_body,
+        };
+
+        format!("{http_response}")
+    }
+    else {
+        format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}")
     };
 
     stream.write_all(response.as_bytes()).unwrap();
 }
 
-fn generate_response(status_code: StatusCode) -> String {
-    let status = generate_status_line(status_code);
-    //let header = generate_header();
-    //let content = generate_body();
+fn echo_page(http_request: &HttpRequest) -> (Vec<Header>, ResponseBody) {
+    let split: Vec<&str> =
+        http_request.request_line.request_target.split("/").collect();
 
-    //format!("{status}{header}{content}")
-    format!("{status}")
+    let response_body = ResponseBody(split[split.len()-1].to_string());
+
+    let content_length = Header {
+        name: "Content-Length".to_string(),
+        value: response_body.0.len().to_string(),
+    };
+    let headers: Vec<Header> = vec![content_length];
+
+    (headers, response_body)
 }
 
-fn generate_status_line(status_code: StatusCode) -> StatusLine {
-    StatusLine::new(status_code)
-}
 
-fn generate_header() -> Header {
-    format!("\r\n");
-    todo!()
-}
 
-fn generate_body() -> String {
-    format!("")
-}
+
+
+
