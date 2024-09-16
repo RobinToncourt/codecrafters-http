@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-#[allow(unused_imports)]
+use std::thread;
 use std::fmt;
 use std::collections::HashMap;
 use std::io::{
@@ -50,8 +50,8 @@ impl HttpRequest {
             headers.insert(key, value);
             index += 1;
         }
-        let request_body =
-            RequestBody(if let Some(tmp) = &http_request.get(index) {
+        let request_body = RequestBody(
+            if let Some(tmp) = &http_request.get(index) {
             tmp
         }
         else {
@@ -211,7 +211,9 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                handle_connection(stream);
+                thread::spawn(|| {
+                    handle_connection(stream);
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
