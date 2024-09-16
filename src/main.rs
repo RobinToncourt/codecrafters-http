@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 use std::thread;
+use std::env;
 use std::fmt;
+use std::fs::File;
 use std::collections::HashMap;
 use std::io::{
     prelude::*,
@@ -206,13 +208,16 @@ impl fmt::Display for ResponseBody {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
     for stream in listener.incoming() {
+        let cloned_args = args.clone();
         match stream {
             Ok(stream) => {
-                thread::spawn(|| {
-                    handle_connection(stream);
+                thread::spawn(move || {
+                    handle_connection(stream, cloned_args);
                 });
             }
             Err(e) => {
@@ -222,7 +227,7 @@ fn main() {
     }
 }
 
-fn handle_connection(mut stream: TcpStream) {
+fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
     let http_request = HttpRequest::from_stream(&mut stream).unwrap();
 
     let request_target: &str = &http_request.request_line.request_target;
@@ -245,7 +250,7 @@ fn handle_connection(mut stream: TcpStream) {
     }
     else if request_target.eq("/user-agent") {
         let (headers, response_body): (Vec<Header>, ResponseBody) =
-        user_agent_page(&http_request);
+            user_agent_page(&http_request);
 
         let status_line = StatusLine::new(StatusCode::OK);
 
@@ -257,6 +262,22 @@ fn handle_connection(mut stream: TcpStream) {
 
         format!("{http_response}")
     }
+    else if request_target.starts_with("/files/") {
+        match file_page(&http_request, args) {
+            Ok((headers, response_body)) => {
+                let status_line = StatusLine::new(StatusCode::OK);
+
+                let http_response = HttpResponse {
+                    status_line,
+                    headers,
+                    response_body,
+                };
+
+                format!("{http_response}")
+            },
+            Err(err) => format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}"),
+        }
+    }
     else {
         format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}")
     };
@@ -267,10 +288,10 @@ fn handle_connection(mut stream: TcpStream) {
 
 fn echo_page(http_request: &HttpRequest) -> (Vec<Header>, ResponseBody) {
     let split: Vec<&str> = http_request
-    .request_line
-    .request_target
-    .split("/")
-    .collect();
+        .request_line
+        .request_target
+        .split("/")
+        .collect();
 
     let response_body = ResponseBody(split[split.len()-1].to_string());
 
@@ -294,18 +315,43 @@ fn user_agent_page(http_request: &HttpRequest) -> (Vec<Header>, ResponseBody) {
     let response_body = ResponseBody(user_agent_value.to_string());
 
     let content_type = Header::new(
-        "Content-Type".to_string(),
-                                   "text/plain".to_string(),
+        "Content-Type".to_string(), "text/plain".to_string(),
     );
     let content_length = Header::new(
-        "Content-Length".to_string(),
-                                     response_body.0.len().to_string(),
+        "Content-Length".to_string(), response_body.0.len().to_string(),
     );
     let headers: Vec<Header> = vec![content_type, content_length];
 
     (headers, response_body)
 }
 
+fn file_page(
+    http_request: &HttpRequest,
+    args: Vec<String>,
+) -> std::io::Result<(Vec<Header>, ResponseBody)> {
+    let split: Vec<&str> = http_request
+        .request_line
+        .request_target
+        .split("/")
+        .collect();
 
+    let filename = format!("{}{}", args[2], split[2]);
+
+    let mut file = File::open(filename)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let response_body = ResponseBody(content);
+
+    let content_type = Header::new(
+        "Content-Type".to_string(), "application/octet-stream".to_string(),
+    );
+    let content_length = Header::new(
+        "Content-Length".to_string(), response_body.0.len().to_string(),
+    );
+
+    let headers: Vec<Header> = vec![content_type, content_length];
+
+    Ok((headers, response_body))
+}
 
 
