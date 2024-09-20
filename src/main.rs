@@ -5,9 +5,9 @@ use std::fmt;
 use std::fs::File;
 use std::collections::HashMap;
 use std::io::{
+    Error,
     prelude::*,
     Write,
-    BufReader,
 };
 use std::net::{
     TcpStream,
@@ -18,7 +18,7 @@ const CRLF: &str = "\r\n";
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 enum HttpError {
-
+    UnknowHttpMethod,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -30,12 +30,16 @@ struct HttpRequest {
 
 impl HttpRequest {
     fn from_stream(stream: &mut TcpStream) -> Result<Self, HttpError> {
-        let buf_reader = BufReader::new(stream);
-        let http_request: Vec<String> = buf_reader
-            .lines()
-            .map(|result| result.unwrap())
-            .take_while(|line| !line.is_empty())
-            .collect();
+        // let buf_reader = BufReader::new(stream);
+        // let http_request: Vec<String> = buf_reader
+        //     .lines()
+        //     .map(|result| result.unwrap())
+        //     .take_while(|line| !line.is_empty())
+        //     .collect();
+
+        let http_request: Vec<String> = read_stream_to_string(stream).unwrap();
+
+        println!("{http_request:?}");
 
         let request_line =
             RequestLine::from_str(&http_request[0]).unwrap();
@@ -52,21 +56,44 @@ impl HttpRequest {
             headers.insert(key, value);
             index += 1;
         }
+
+        index += 1;
+
         let request_body = RequestBody(
             if let Some(tmp) = &http_request.get(index) {
-            tmp
-        }
-        else {
-            ""
-        }.to_string());
+                tmp
+            }
+            else {
+                ""
+            }.to_string());
+
+        println!("{request_line:?}\n{headers:?}\n{request_body:?}");
 
         Ok(Self { request_line, headers, request_body })
     }
 }
 
+fn read_stream_to_string(stream: &mut TcpStream) -> Result<Vec<String>, Error> {
+    let mut data: Vec<u8> = Vec::new();
+
+    loop {
+        let mut buffer: [u8; 1024] = [0; 1024];
+        let nb_bytes: usize = stream.read(&mut buffer)?;
+
+        buffer.into_iter().take(nb_bytes).for_each(|b| data.push(b));
+
+        if nb_bytes < 1024 {
+            break;
+        }
+    }
+
+    let content: String = String::from_utf8(data).unwrap();
+    Ok(content.lines().map(|s| s.to_string()).collect::<Vec<String>>())
+}
+
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 struct RequestLine {
-    http_method: String,
+    http_method: HttpMethod,
     request_target: String,
     http_version: String,
 }
@@ -75,11 +102,28 @@ impl RequestLine {
     fn from_str(request_line: &str) -> Result<Self, HttpError> {
         let mut split = request_line.split_whitespace();
 
-        let http_method: String = split.next().unwrap().to_string();
+        let http_method: HttpMethod =
+            HttpMethod::from_str(split.next().unwrap())?;
         let request_target: String = split.next().unwrap().to_string();
         let http_version: String = split.next().unwrap().to_string();
 
         Ok(Self { http_method, request_target, http_version })
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+enum HttpMethod {
+    Get,
+    Post,
+}
+
+impl HttpMethod {
+    fn from_str(s: &str) -> Result<Self, HttpError> {
+        match s {
+            "GET" => Ok(HttpMethod::Get),
+            "POST" => Ok(HttpMethod::Post),
+            _ => Err(HttpError::UnknowHttpMethod),
+        }
     }
 }
 
@@ -99,6 +143,10 @@ struct HttpResponse {
     response_body: ResponseBody,
 }
 
+impl HttpResponse {
+    //const NOT_FOUND: HttpResponse
+}
+
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}{CRLF}{}{CRLF}{}",
@@ -109,7 +157,7 @@ impl fmt::Display for HttpResponse {
     }
 }
 
-fn join_headers(headers: &Vec<Header>) -> String {
+fn join_headers(headers: &[Header]) -> String {
     let mut joined_headers = String::new();
 
     headers.iter()
@@ -152,6 +200,8 @@ impl fmt::Display for StatusLine {
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 enum StatusCode {
     OK = 200,
+    Created = 201,
+    BadRequest = 400,
     NotFound = 404,
 }
 
@@ -159,6 +209,8 @@ impl StatusCode {
     fn reason_phrase(&self) -> String {
         match self {
             StatusCode::OK => "OK",
+            StatusCode::Created => "Created",
+            StatusCode::BadRequest => "Bad Request",
             StatusCode::NotFound => "Not Found",
         }.to_string()
     }
@@ -178,12 +230,8 @@ impl Header {
     fn parse(header: &str) -> Option<(String, String)> {
         let mut split = header.split(": ");
 
-        let Some(name) = split.next() else {
-            return None;
-        };
-        let Some(value) = split.next() else {
-            return None;
-        };
+        let name = split.next()?;
+        let value = split.next()?;
 
         Some((name.to_string(), value.to_string()))
     }
@@ -209,6 +257,7 @@ impl fmt::Display for ResponseBody {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
 
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
@@ -262,8 +311,9 @@ fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
 
         format!("{http_response}")
     }
-    else if request_target.starts_with("/files/") {
-        match file_page(&http_request, args) {
+    else if request_target.starts_with("/files/")
+        && http_request.request_line.http_method.eq(&HttpMethod::Get) {
+        match get_file_page(&http_request, args) {
             Ok((headers, response_body)) => {
                 let status_line = StatusLine::new(StatusCode::OK);
 
@@ -275,7 +325,24 @@ fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
 
                 format!("{http_response}")
             },
-            Err(err) => format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}"),
+            Err(_) => format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}"),
+        }
+    }
+    else if request_target.starts_with("/files/")
+        && http_request.request_line.http_method.eq(&HttpMethod::Post) {
+        match post_file_page(&http_request, args) {
+            Ok((headers, response_body)) => {
+                let status_line = StatusLine::new(StatusCode::Created);
+
+                let http_response = HttpResponse {
+                    status_line,
+                    headers,
+                    response_body,
+                };
+
+                format!("{http_response}")
+            },
+            Err(_) => format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}"),
         }
     }
     else {
@@ -325,7 +392,7 @@ fn user_agent_page(http_request: &HttpRequest) -> (Vec<Header>, ResponseBody) {
     (headers, response_body)
 }
 
-fn file_page(
+fn get_file_page(
     http_request: &HttpRequest,
     args: Vec<String>,
 ) -> std::io::Result<(Vec<Header>, ResponseBody)> {
@@ -354,4 +421,23 @@ fn file_page(
     Ok((headers, response_body))
 }
 
+fn post_file_page(
+    http_request: &HttpRequest,
+    args: Vec<String>,
+) -> std::io::Result<(Vec<Header>, ResponseBody)> {
+    let split: Vec<&str> = http_request
+        .request_line
+        .request_target
+        .split("/")
+        .collect();
 
+    let filename = format!("{}{}", args[2], split[2]);
+
+    let mut file = File::create(filename)?;
+    file.write_all(http_request.request_body.0.as_bytes())?;
+
+    let headers: Vec<Header> = Vec::new();
+    let response_body = ResponseBody(String::new());
+
+    Ok((headers, response_body))
+}
