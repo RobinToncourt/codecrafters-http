@@ -11,6 +11,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 
 const CRLF: &str = "\r\n";
+const SUPPORTED_ENCODING: [&str; 1] = ["gzip"];
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 enum HttpError {
@@ -408,7 +409,13 @@ fn post_file_page(
 }
 
 fn encode_body(http_request: &HttpRequest, headers: &mut HashMap<String, String>, body: &ResponseBody) -> ResponseBody {
-    let encoding = http_request.headers.get("Accept-Encoding").map_or("", String::as_str);
+    let encodings: &str = http_request.headers.get("Accept-Encoding").map_or("", String::as_str);
+
+    let client_encodings: Vec<&str> = encodings.split(", ").collect();
+
+    let common_supported_encoding: Vec<&str> = common_str_elements(&SUPPORTED_ENCODING, &client_encodings);
+
+    let encoding: &str = common_supported_encoding.first().unwrap_or(&"");
 
     let body: ResponseBody = match encoding {
         "gzip" => {
@@ -420,6 +427,20 @@ fn encode_body(http_request: &HttpRequest, headers: &mut HashMap<String, String>
     };
 
     body
+}
+
+fn common_str_elements<'a>(
+    server: &'a [&'a str], client: &'a [&'a str]
+) -> Vec<&'a str> {
+    let mut result: Vec<&str> = Vec::new();
+
+    for s in server {
+        if client.contains(s) {
+            result.push(s);
+        }
+    }
+
+    result
 }
 
 fn gzip_encoding(body: &ResponseBody) -> ResponseBody {
