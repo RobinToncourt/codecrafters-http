@@ -1,18 +1,14 @@
 #![allow(dead_code)]
-use std::thread;
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::fs::File;
-use std::collections::HashMap;
-use std::io::{
-    Error,
-    prelude::*,
-    Write,
-};
-use std::net::{
-    TcpStream,
-    TcpListener,
-};
+use std::io::{prelude::*, Error, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 const CRLF: &str = "\r\n";
 
@@ -30,19 +26,9 @@ struct HttpRequest {
 
 impl HttpRequest {
     fn from_stream(stream: &mut TcpStream) -> Result<Self, HttpError> {
-        // let buf_reader = BufReader::new(stream);
-        // let http_request: Vec<String> = buf_reader
-        //     .lines()
-        //     .map(|result| result.unwrap())
-        //     .take_while(|line| !line.is_empty())
-        //     .collect();
-
         let http_request: Vec<String> = read_stream_to_string(stream).unwrap();
 
-        println!("{http_request:?}");
-
-        let request_line =
-            RequestLine::from_str(&http_request[0]).unwrap();
+        let request_line = RequestLine::from_str(&http_request[0]).unwrap();
 
         let mut headers: HashMap<String, String> = HashMap::new();
         let mut index: usize = 1;
@@ -50,7 +36,7 @@ impl HttpRequest {
             let Some(tmp) = &http_request.get(index) else {
                 break;
             };
-            let Some((key, value)) = Header::parse(tmp) else {
+            let Some((key, value)) = parse_header(tmp) else {
                 break;
             };
             headers.insert(key, value);
@@ -62,15 +48,27 @@ impl HttpRequest {
         let request_body = RequestBody(
             if let Some(tmp) = &http_request.get(index) {
                 tmp
-            }
-            else {
+            } else {
                 ""
-            }.to_string());
+            }
+            .to_string(),
+        );
 
-        println!("{request_line:?}\n{headers:?}\n{request_body:?}");
-
-        Ok(Self { request_line, headers, request_body })
+        Ok(Self {
+            request_line,
+            headers,
+            request_body,
+        })
     }
+}
+
+fn parse_header(header: &str) -> Option<(String, String)> {
+    let mut split = header.split(": ");
+
+    let name = split.next()?;
+    let value = split.next()?;
+
+    Some((name.to_string(), value.to_string()))
 }
 
 fn read_stream_to_string(stream: &mut TcpStream) -> Result<Vec<String>, Error> {
@@ -88,7 +86,10 @@ fn read_stream_to_string(stream: &mut TcpStream) -> Result<Vec<String>, Error> {
     }
 
     let content: String = String::from_utf8(data).unwrap();
-    Ok(content.lines().map(|s| s.to_string()).collect::<Vec<String>>())
+    Ok(content
+        .lines()
+        .map(|s| s.to_string())
+        .collect::<Vec<String>>())
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -102,12 +103,15 @@ impl RequestLine {
     fn from_str(request_line: &str) -> Result<Self, HttpError> {
         let mut split = request_line.split_whitespace();
 
-        let http_method: HttpMethod =
-            HttpMethod::from_str(split.next().unwrap())?;
+        let http_method: HttpMethod = HttpMethod::from_str(split.next().unwrap())?;
         let request_target: String = split.next().unwrap().to_string();
         let http_version: String = split.next().unwrap().to_string();
 
-        Ok(Self { http_method, request_target, http_version })
+        Ok(Self {
+            http_method,
+            request_target,
+            http_version,
+        })
     }
 }
 
@@ -136,10 +140,10 @@ impl fmt::Display for RequestBody {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 struct HttpResponse {
     status_line: StatusLine,
-    headers: Vec<Header>,
+    headers: HashMap<String, String>,
     response_body: ResponseBody,
 }
 
@@ -149,21 +153,22 @@ impl HttpResponse {
 
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{CRLF}{}{CRLF}{}",
-               self.status_line,
-               join_headers(&self.headers),
-               self.response_body
+        write!(
+            f,
+            "{}{CRLF}{}{CRLF}{}",
+            self.status_line,
+            join_headers(&self.headers),
+            self.response_body
         )
     }
 }
 
-fn join_headers(headers: &[Header]) -> String {
+fn join_headers(headers: &HashMap<String, String>) -> String {
     let mut joined_headers = String::new();
 
-    headers.iter()
-    .for_each(
-        |header| joined_headers.push_str(&header.to_string())
-    );
+    headers
+        .iter()
+        .for_each(|(name, value)| joined_headers.push_str(&format!("{name}: {value}{CRLF}")));
 
     joined_headers
 }
@@ -189,10 +194,12 @@ impl StatusLine {
 
 impl fmt::Display for StatusLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {} {}",
-               self.http_version,
-               self.status_code as usize,
-               self.status_code.reason_phrase()
+        write!(
+            f,
+            "{} {} {}",
+            self.http_version,
+            self.status_code as usize,
+            self.status_code.reason_phrase()
         )
     }
 }
@@ -212,37 +219,8 @@ impl StatusCode {
             StatusCode::Created => "Created",
             StatusCode::BadRequest => "Bad Request",
             StatusCode::NotFound => "Not Found",
-        }.to_string()
-    }
-}
-
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-struct Header {
-    name: String,
-    value: String,
-}
-
-impl Header {
-    fn new(name: String, value: String) -> Self {
-        Self { name, value }
-    }
-
-    fn parse(header: &str) -> Option<(String, String)> {
-        let mut split = header.split(": ");
-
-        let name = split.next()?;
-        let value = split.next()?;
-
-        Some((name.to_string(), value.to_string()))
-    }
-}
-
-impl fmt::Display for Header {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}{CRLF}",
-               self.name,
-               self.value,
-        )
+        }
+        .to_string()
     }
 }
 
@@ -257,7 +235,6 @@ impl fmt::Display for ResponseBody {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-
 
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
@@ -280,114 +257,107 @@ fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
     let http_request = HttpRequest::from_stream(&mut stream).unwrap();
 
     let request_target: &str = &http_request.request_line.request_target;
-    let response: String = if request_target.eq("/") {
-        format!("HTTP/1.1 200 OK{CRLF}{CRLF}")
-    }
-    else if request_target.starts_with("/echo/") {
-        let (headers, response_body): (Vec<Header>, ResponseBody) =
-        echo_page(&http_request);
+
+    let (status_line, mut headers, response_body):
+    (StatusLine, HashMap<String, String>, ResponseBody) =
+    if request_target.eq("/") {
+        let status_line = StatusLine::new(StatusCode::OK);
+        let headers: HashMap<String, String> = HashMap::new();
+        let response_body = ResponseBody("".to_string());
+
+        (status_line, headers, response_body)
+    } else if request_target.starts_with("/echo/") {
+        let (headers, response_body): (HashMap<String, String>, ResponseBody) = echo_page(&http_request);
 
         let status_line = StatusLine::new(StatusCode::OK);
 
-        let http_response = HttpResponse {
-            status_line,
-            headers,
-            response_body,
-        };
-
-        format!("{http_response}")
-    }
-    else if request_target.eq("/user-agent") {
-        let (headers, response_body): (Vec<Header>, ResponseBody) =
-            user_agent_page(&http_request);
+        (status_line, headers, response_body)
+    } else if request_target.eq("/user-agent") {
+        let (headers, response_body): (HashMap<String, String>, ResponseBody) = user_agent_page(&http_request);
 
         let status_line = StatusLine::new(StatusCode::OK);
 
-        let http_response = HttpResponse {
-            status_line,
-            headers,
-            response_body,
-        };
-
-        format!("{http_response}")
-    }
-    else if request_target.starts_with("/files/")
-        && http_request.request_line.http_method.eq(&HttpMethod::Get) {
+        (status_line, headers, response_body)
+    } else if request_target.starts_with("/files/")
+        && http_request.request_line.http_method.eq(&HttpMethod::Get)
+    {
         match get_file_page(&http_request, args) {
             Ok((headers, response_body)) => {
                 let status_line = StatusLine::new(StatusCode::OK);
 
-                let http_response = HttpResponse {
-                    status_line,
-                    headers,
-                    response_body,
-                };
+                (status_line, headers, response_body)
+            }
+            Err(_) => {
+                let status_line = StatusLine::new(StatusCode::NotFound);
+                let headers: HashMap<String, String> = HashMap::new();
+                let response_body = ResponseBody("".to_string());
 
-                format!("{http_response}")
+                (status_line, headers, response_body)
             },
-            Err(_) => format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}"),
         }
-    }
-    else if request_target.starts_with("/files/")
-        && http_request.request_line.http_method.eq(&HttpMethod::Post) {
+    } else if request_target.starts_with("/files/")
+        && http_request.request_line.http_method.eq(&HttpMethod::Post)
+    {
         match post_file_page(&http_request, args) {
             Ok((headers, response_body)) => {
                 let status_line = StatusLine::new(StatusCode::Created);
 
-                let http_response = HttpResponse {
-                    status_line,
-                    headers,
-                    response_body,
-                };
+                (status_line, headers, response_body)
+            }
+            Err(_) => {
+                let status_line = StatusLine::new(StatusCode::NotFound);
+                let headers: HashMap<String, String> = HashMap::new();
+                let response_body = ResponseBody("".to_string());
 
-                format!("{http_response}")
+                (status_line, headers, response_body)
             },
-            Err(_) => format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}"),
         }
-    }
-    else {
-        format!("HTTP/1.1 404 Not Found{CRLF}{CRLF}")
+    } else {
+        let status_line = StatusLine::new(StatusCode::NotFound);
+        let headers: HashMap<String, String> = HashMap::new();
+        let response_body = ResponseBody("".to_string());
+
+        (status_line, headers, response_body)
     };
 
-    println!("{response}");
-    stream.write_all(response.as_bytes()).unwrap();
+    let response_body: ResponseBody = encode_body(&http_request, &mut headers, &response_body);
+
+    let http_response = HttpResponse {
+        status_line,
+        headers,
+        response_body,
+    };
+
+    stream.write_all(format!("{http_response}").as_bytes()).unwrap();
 }
 
-fn echo_page(http_request: &HttpRequest) -> (Vec<Header>, ResponseBody) {
+fn echo_page(http_request: &HttpRequest) -> (HashMap<String, String>, ResponseBody) {
     let split: Vec<&str> = http_request
         .request_line
         .request_target
         .split("/")
         .collect();
 
-    let response_body = ResponseBody(split[split.len()-1].to_string());
+    let response_body = ResponseBody(split[split.len() - 1].to_string());
 
-    let content_type = Header::new(
-        "Content-Type".to_string(),
-                                   "text/plain".to_string(),
-    );
-    let content_length = Header::new(
-        "Content-Length".to_string(),
-                                     response_body.0.len().to_string(),
-    );
-    let headers: Vec<Header> = vec![content_type, content_length];
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("Content-Type".to_string(), "text/plain".to_string());
+    headers.insert("Content-Length".to_string(), response_body.0.len().to_string());
 
     (headers, response_body)
 }
 
-fn user_agent_page(http_request: &HttpRequest) -> (Vec<Header>, ResponseBody) {
-    let user_agent_value: &str =
-    http_request.headers.get("User-Agent").expect("No User-Agent header");
+fn user_agent_page(http_request: &HttpRequest) -> (HashMap<String, String>, ResponseBody) {
+    let user_agent_value: &str = http_request
+        .headers
+        .get("User-Agent")
+        .expect("No User-Agent header");
 
     let response_body = ResponseBody(user_agent_value.to_string());
 
-    let content_type = Header::new(
-        "Content-Type".to_string(), "text/plain".to_string(),
-    );
-    let content_length = Header::new(
-        "Content-Length".to_string(), response_body.0.len().to_string(),
-    );
-    let headers: Vec<Header> = vec![content_type, content_length];
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("Content-Type".to_string(), "text/plain".to_string());
+    headers.insert("Content-Length".to_string(), response_body.0.len().to_string());
 
     (headers, response_body)
 }
@@ -395,7 +365,7 @@ fn user_agent_page(http_request: &HttpRequest) -> (Vec<Header>, ResponseBody) {
 fn get_file_page(
     http_request: &HttpRequest,
     args: Vec<String>,
-) -> std::io::Result<(Vec<Header>, ResponseBody)> {
+) -> std::io::Result<(HashMap<String, String>, ResponseBody)> {
     let split: Vec<&str> = http_request
         .request_line
         .request_target
@@ -409,14 +379,9 @@ fn get_file_page(
     file.read_to_string(&mut content)?;
     let response_body = ResponseBody(content);
 
-    let content_type = Header::new(
-        "Content-Type".to_string(), "application/octet-stream".to_string(),
-    );
-    let content_length = Header::new(
-        "Content-Length".to_string(), response_body.0.len().to_string(),
-    );
-
-    let headers: Vec<Header> = vec![content_type, content_length];
+    let mut headers: HashMap<String, String> = HashMap::new();
+    headers.insert("Content-Type".to_string(), "application/octet-stream".to_string());
+    headers.insert("Content-Length".to_string(), response_body.0.len().to_string());
 
     Ok((headers, response_body))
 }
@@ -424,7 +389,7 @@ fn get_file_page(
 fn post_file_page(
     http_request: &HttpRequest,
     args: Vec<String>,
-) -> std::io::Result<(Vec<Header>, ResponseBody)> {
+) -> std::io::Result<(HashMap<String, String>, ResponseBody)> {
     let split: Vec<&str> = http_request
         .request_line
         .request_target
@@ -436,8 +401,43 @@ fn post_file_page(
     let mut file = File::create(filename)?;
     file.write_all(http_request.request_body.0.as_bytes())?;
 
-    let headers: Vec<Header> = Vec::new();
+    let headers: HashMap<String, String> = HashMap::new();
     let response_body = ResponseBody(String::new());
 
     Ok((headers, response_body))
 }
+
+fn encode_body(http_request: &HttpRequest, headers: &mut HashMap<String, String>, body: &ResponseBody) -> ResponseBody {
+    let encoding = http_request.headers.get("Accept-Encoding").map_or("", String::as_str);
+
+    let body: ResponseBody = match encoding {
+        "gzip" => {
+            headers.insert("Content-Encoding".to_string(), "gzip".to_string());
+            //gzip_encoding(body)
+            ResponseBody(body.0.clone())
+        },
+        _ => ResponseBody(body.0.clone()),
+    };
+
+    body
+}
+
+fn gzip_encoding(body: &ResponseBody) -> ResponseBody {
+    let mut gzip_encoder = GzEncoder::new(Vec::new(), Compression::default());
+    gzip_encoder.write_all(body.0.as_bytes()).unwrap();
+
+    //ResponseBody(gzip_encoder.finish().unwrap())
+    todo!()
+}
+
+
+
+
+
+
+
+
+
+
+
+
