@@ -7,3 +7,4 @@ rust-version = "1.80"
 
 [dependencies]
 flate2 = "1.0.33"
+either = "1.13.0"

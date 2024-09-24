@@ -7,8 +7,10 @@ use std::io::{prelude::*, Error, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 
-use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::Compression;
+
+use either::*;
 
 const CRLF: &str = "\r\n";
 const SUPPORTED_ENCODING: [&str; 1] = ["gzip"];
@@ -22,7 +24,7 @@ enum HttpError {
 struct HttpRequest {
     request_line: RequestLine,
     headers: HashMap<String, String>,
-    request_body: RequestBody,
+    request_body: Option<String>,
 }
 
 impl HttpRequest {
@@ -46,14 +48,7 @@ impl HttpRequest {
 
         index += 1;
 
-        let request_body = RequestBody(
-            if let Some(tmp) = &http_request.get(index) {
-                tmp
-            } else {
-                ""
-            }
-            .to_string(),
-        );
+        let request_body = http_request.get(index).cloned();
 
         Ok(Self {
             request_line,
@@ -132,34 +127,48 @@ impl HttpMethod {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-struct RequestBody(String);
-
-impl fmt::Display for RequestBody {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 #[derive(PartialEq, Eq, Debug)]
 struct HttpResponse {
     status_line: StatusLine,
     headers: HashMap<String, String>,
-    response_body: ResponseBody,
+    response_body: Either<String, Vec<u8>>,
 }
 
 impl HttpResponse {
     //const NOT_FOUND: HttpResponse
+
+    fn write_all(&self, stream: &mut TcpStream) {
+        stream
+            .write_all(
+                &format!(
+                    "{}{CRLF}{}{CRLF}",
+                    self.status_line,
+                    join_headers(&self.headers),
+                )
+                .into_bytes(),
+            )
+            .unwrap();
+
+        match &self.response_body {
+            Either::Left(s) => stream.write_all(s.as_bytes()).unwrap(),
+            Either::Right(v) => stream.write_all(v).unwrap(),
+        }
+    }
 }
 
 impl fmt::Display for HttpResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rbs: String = match &self.response_body {
+            Either::Left(s) => s.clone(),
+            Either::Right(v) => format!("{v:?}"),
+        };
+
         write!(
             f,
             "{}{CRLF}{}{CRLF}{}",
             self.status_line,
             join_headers(&self.headers),
-            self.response_body
+            rbs
         )
     }
 }
@@ -225,12 +234,10 @@ impl StatusCode {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-struct ResponseBody(String);
-
-impl fmt::Display for ResponseBody {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+fn byte_array_to_hex_string(arr: Vec<u8>) -> String {
+    match String::from_utf8(arr) {
+        Ok(s) => s,
+        Err(e) => panic!("Invalid UTF-8 sequence: {e}"),
     }
 }
 
@@ -259,22 +266,26 @@ fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
 
     let request_target: &str = &http_request.request_line.request_target;
 
-    let (status_line, mut headers, response_body):
-    (StatusLine, HashMap<String, String>, ResponseBody) =
-    if request_target.eq("/") {
+    let (status_line, mut headers, response_body): (
+        StatusLine,
+        HashMap<String, String>,
+        Option<String>,
+    ) = if request_target.eq("/") {
         let status_line = StatusLine::new(StatusCode::OK);
         let headers: HashMap<String, String> = HashMap::new();
-        let response_body = ResponseBody("".to_string());
+        let response_body = None;
 
         (status_line, headers, response_body)
     } else if request_target.starts_with("/echo/") {
-        let (headers, response_body): (HashMap<String, String>, ResponseBody) = echo_page(&http_request);
+        let (headers, response_body): (HashMap<String, String>, Option<String>) =
+            echo_page(&http_request);
 
         let status_line = StatusLine::new(StatusCode::OK);
 
         (status_line, headers, response_body)
     } else if request_target.eq("/user-agent") {
-        let (headers, response_body): (HashMap<String, String>, ResponseBody) = user_agent_page(&http_request);
+        let (headers, response_body): (HashMap<String, String>, Option<String>) =
+            user_agent_page(&http_request);
 
         let status_line = StatusLine::new(StatusCode::OK);
 
@@ -291,10 +302,10 @@ fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
             Err(_) => {
                 let status_line = StatusLine::new(StatusCode::NotFound);
                 let headers: HashMap<String, String> = HashMap::new();
-                let response_body = ResponseBody("".to_string());
+                let response_body = None;
 
                 (status_line, headers, response_body)
-            },
+            }
         }
     } else if request_target.starts_with("/files/")
         && http_request.request_line.http_method.eq(&HttpMethod::Post)
@@ -308,20 +319,29 @@ fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
             Err(_) => {
                 let status_line = StatusLine::new(StatusCode::NotFound);
                 let headers: HashMap<String, String> = HashMap::new();
-                let response_body = ResponseBody("".to_string());
+                let response_body = None;
 
                 (status_line, headers, response_body)
-            },
+            }
         }
     } else {
         let status_line = StatusLine::new(StatusCode::NotFound);
         let headers: HashMap<String, String> = HashMap::new();
-        let response_body = ResponseBody("".to_string());
+        let response_body = None;
 
         (status_line, headers, response_body)
     };
 
-    let response_body: ResponseBody = encode_body(&http_request, &mut headers, &response_body);
+    let response_body: Either<String, Vec<u8>> = encode_body(
+        &http_request,
+        &mut headers,
+        response_body.unwrap_or(String::new()),
+    );
+
+    match &response_body {
+        Either::Left(s) => headers.insert("Content-Length".to_string(), s.len().to_string()),
+        Either::Right(v) => headers.insert("Content-Length".to_string(), v.len().to_string()),
+    };
 
     let http_response = HttpResponse {
         status_line,
@@ -329,36 +349,34 @@ fn handle_connection(mut stream: TcpStream, args: Vec<String>) {
         response_body,
     };
 
-    stream.write_all(format!("{http_response}").as_bytes()).unwrap();
+    http_response.write_all(&mut stream);
 }
 
-fn echo_page(http_request: &HttpRequest) -> (HashMap<String, String>, ResponseBody) {
+fn echo_page(http_request: &HttpRequest) -> (HashMap<String, String>, Option<String>) {
     let split: Vec<&str> = http_request
         .request_line
         .request_target
         .split("/")
         .collect();
 
-    let response_body = ResponseBody(split[split.len() - 1].to_string());
+    let response_body = Some(split[split.len() - 1].to_string());
 
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert("Content-Type".to_string(), "text/plain".to_string());
-    headers.insert("Content-Length".to_string(), response_body.0.len().to_string());
 
     (headers, response_body)
 }
 
-fn user_agent_page(http_request: &HttpRequest) -> (HashMap<String, String>, ResponseBody) {
+fn user_agent_page(http_request: &HttpRequest) -> (HashMap<String, String>, Option<String>) {
     let user_agent_value: &str = http_request
         .headers
         .get("User-Agent")
         .expect("No User-Agent header");
 
-    let response_body = ResponseBody(user_agent_value.to_string());
+    let response_body = Some(user_agent_value.to_string());
 
     let mut headers: HashMap<String, String> = HashMap::new();
     headers.insert("Content-Type".to_string(), "text/plain".to_string());
-    headers.insert("Content-Length".to_string(), response_body.0.len().to_string());
 
     (headers, response_body)
 }
@@ -366,7 +384,7 @@ fn user_agent_page(http_request: &HttpRequest) -> (HashMap<String, String>, Resp
 fn get_file_page(
     http_request: &HttpRequest,
     args: Vec<String>,
-) -> std::io::Result<(HashMap<String, String>, ResponseBody)> {
+) -> std::io::Result<(HashMap<String, String>, Option<String>)> {
     let split: Vec<&str> = http_request
         .request_line
         .request_target
@@ -378,11 +396,13 @@ fn get_file_page(
     let mut file = File::open(filename)?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    let response_body = ResponseBody(content);
+    let response_body = Some(content);
 
     let mut headers: HashMap<String, String> = HashMap::new();
-    headers.insert("Content-Type".to_string(), "application/octet-stream".to_string());
-    headers.insert("Content-Length".to_string(), response_body.0.len().to_string());
+    headers.insert(
+        "Content-Type".to_string(),
+        "application/octet-stream".to_string(),
+    );
 
     Ok((headers, response_body))
 }
@@ -390,7 +410,7 @@ fn get_file_page(
 fn post_file_page(
     http_request: &HttpRequest,
     args: Vec<String>,
-) -> std::io::Result<(HashMap<String, String>, ResponseBody)> {
+) -> std::io::Result<(HashMap<String, String>, Option<String>)> {
     let split: Vec<&str> = http_request
         .request_line
         .request_target
@@ -400,38 +420,43 @@ fn post_file_page(
     let filename = format!("{}{}", args[2], split[2]);
 
     let mut file = File::create(filename)?;
-    file.write_all(http_request.request_body.0.as_bytes())?;
+    file.write_all(http_request.request_body.clone().unwrap().as_bytes())?;
 
     let headers: HashMap<String, String> = HashMap::new();
-    let response_body = ResponseBody(String::new());
+    let response_body = None;
 
     Ok((headers, response_body))
 }
 
-fn encode_body(http_request: &HttpRequest, headers: &mut HashMap<String, String>, body: &ResponseBody) -> ResponseBody {
-    let encodings: &str = http_request.headers.get("Accept-Encoding").map_or("", String::as_str);
+fn encode_body(
+    http_request: &HttpRequest,
+    headers: &mut HashMap<String, String>,
+    body: String,
+) -> Either<String, Vec<u8>> {
+    let encodings: &str = http_request
+        .headers
+        .get("Accept-Encoding")
+        .map_or("", String::as_str);
 
     let client_encodings: Vec<&str> = encodings.split(", ").collect();
 
-    let common_supported_encoding: Vec<&str> = common_str_elements(&SUPPORTED_ENCODING, &client_encodings);
+    let common_supported_encoding: Vec<&str> =
+        common_str_elements(&SUPPORTED_ENCODING, &client_encodings);
 
     let encoding: &str = common_supported_encoding.first().unwrap_or(&"");
 
-    let body: ResponseBody = match encoding {
+    let body: Either<String, Vec<u8>> = match encoding {
         "gzip" => {
             headers.insert("Content-Encoding".to_string(), "gzip".to_string());
-            //gzip_encoding(body)
-            ResponseBody(body.0.clone())
-        },
-        _ => ResponseBody(body.0.clone()),
+            Right(gzip_encoding(body))
+        }
+        _ => Left(body),
     };
 
     body
 }
 
-fn common_str_elements<'a>(
-    server: &'a [&'a str], client: &'a [&'a str]
-) -> Vec<&'a str> {
+fn common_str_elements<'a>(server: &[&'a str], client: &'a [&'a str]) -> Vec<&'a str> {
     let mut result: Vec<&str> = Vec::new();
 
     for s in server {
@@ -443,22 +468,8 @@ fn common_str_elements<'a>(
     result
 }
 
-fn gzip_encoding(body: &ResponseBody) -> ResponseBody {
+fn gzip_encoding(body: String) -> Vec<u8> {
     let mut gzip_encoder = GzEncoder::new(Vec::new(), Compression::default());
-    gzip_encoder.write_all(body.0.as_bytes()).unwrap();
-
-    //ResponseBody(gzip_encoder.finish().unwrap())
-    todo!()
+    gzip_encoder.write_all(body.as_bytes()).unwrap();
+    gzip_encoder.finish().unwrap()
 }
-
-
-
-
-
-
-
-
-
-
-
-
